@@ -4,6 +4,7 @@ package frames
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/jamescun/http2/settings"
 )
@@ -25,15 +26,13 @@ var (
 // Frame is implemented by all HTTP/2 Frame definitions, as defined in RFC 7540
 // Section 6.
 type Frame interface {
-	// GetFrameHeader returns the Header of this Frame, configured with the
-	// Frame's Type, Length and any Flags.
-	GetFrameHeader() Header
+	// MarshalFrame converts a Frame into it's wire format and set the Frame
+	// specific fields on the given Header.
+	MarshalFrame(*Header) ([]byte, error)
 
-	// MarshalFrame converts a Frame into it's wire format.
-	MarshalFrame() ([]byte, error)
-
-	// UnmarshalFrame converts a Frame from it's wire format.
-	UnmarshalFrame([]byte) error
+	// UnmarshalFrame converts a Frame from it's wire format. Header is the
+	// Frame header that preceded the Frame being unmarshalled.
+	UnmarshalFrame(*Header, []byte) error
 }
 
 // Type is the unique identifier given to each Frame. FrameTypes greater than
@@ -153,23 +152,16 @@ type Settings struct {
 	Settings []settings.Setting
 }
 
-// GetFrameHeader returns the Header for this Settings frame.
-func (s Settings) GetFrameHeader() Header {
-	var flags Flags
-	if s.Ack {
-		flags.Set(FlagSettingsAck)
-	}
-
-	return Header{
-		Length:   uint32(6 * len(s.Settings)),
-		Type:     TypeSettings,
-		Flags:    flags,
-		StreamID: 0,
-	}
-}
-
 // MarshalFrame marshals Settings into the wire format.
-func (s *Settings) MarshalFrame() ([]byte, error) {
+func (s *Settings) MarshalFrame(hdr *Header) ([]byte, error) {
+	hdr.Length = uint32(6 * len(s.Settings))
+	hdr.Type = TypeSettings
+	hdr.StreamID = 0
+
+	if s.Ack {
+		hdr.Flags = FlagSettingsAck
+	}
+
 	b := make([]byte, 0, 6*len(s.Settings))
 
 	for _, setting := range s.Settings {
@@ -180,7 +172,7 @@ func (s *Settings) MarshalFrame() ([]byte, error) {
 }
 
 // UnmarshalFrame unmarshals Settings from the wire format.
-func (s *Settings) UnmarshalFrame(b []byte) error {
+func (s *Settings) UnmarshalFrame(hdr *Header, b []byte) error {
 	if len(b) == 0 {
 		return nil
 	}
@@ -190,6 +182,7 @@ func (s *Settings) UnmarshalFrame(b []byte) error {
 		return ErrShortFrame
 	}
 
+	s.Header = *hdr
 	s.Settings = make([]settings.Setting, 0, len(b)/6)
 
 	for len(b) > 0 {
@@ -205,6 +198,162 @@ func (s *Settings) UnmarshalFrame(b []byte) error {
 
 		s.Settings = append(s.Settings, setting)
 	}
+
+	return nil
+}
+
+var (
+	// FlagHeadersEndStream indicates a Headers frame is to also terminate its
+	// Stream (excluding any Continuation frames).
+	// RFC 7540 Section 6.2
+	FlagHeadersEndStream = Flags(0x01)
+
+	// FlagHeadersEndHeaders indicates a Headers frame is the last of the
+	// Headers sent by a peer.
+	// RFC 7540 Section 6.2
+	FlagHeadersEndHeaders = Flags(0x04)
+
+	// FlagHeadersPadded indicates a Headers frame contains trailing padding.
+	// RFC 7540 Section 6.2
+	FlagHeadersPadded = Flags(0x08)
+
+	// FlagHeadersPriority indicates a Headers frame contains priority
+	// information similar to a Priority frame.
+	// RFC 7540 Section 6.2
+	FlagHeadersPriority = Flags(0x20)
+)
+
+// Headers is used to initialize a Stream and contains zero or more HPACK
+// header block fragments.
+//
+// NOTE(jc): Padding and Priority are not currently implemented.
+//
+// RFC 7540 Section 6.2
+type Headers struct {
+	Header
+
+	// EndStream indicates this Header frame (and possible Continuation frames)
+	// are the last in this Stream.
+	EndStream bool
+
+	// EndHeaders indicates this Headers frame is the last of this set and no
+	// other Headers frame or Continuation frame will be sent.
+	EndHeaders bool
+
+	// Block contains an HPACK header block fragment, described in RFC 7541.
+	Block []byte
+}
+
+// MarshalFrame marshals Headers into the wire format.
+func (h *Headers) MarshalFrame(hdr *Header) ([]byte, error) {
+	// TODO(jc): implement security padding and stream prioritization.
+	if h.Header.Flags.Has(FlagHeadersPadded) {
+		return nil, fmt.Errorf("headers: padding not implemented")
+	} else if h.Header.Flags.Has(FlagHeadersPriority) {
+		return nil, fmt.Errorf("headers: priority not implemented")
+	}
+
+	if h.EndStream {
+		hdr.Flags.Set(FlagHeadersEndStream)
+	}
+	if h.EndHeaders {
+		hdr.Flags.Set(FlagHeadersEndHeaders)
+	}
+
+	hdr.Type = TypeHeaders
+	hdr.Length = uint32(len(h.Block))
+	hdr.StreamID = h.StreamID
+
+	b := make([]byte, len(h.Block))
+	copy(b, h.Block)
+
+	return b, nil
+}
+
+// UnmarshalFrame unmarshals Headers from the wire format.
+func (h *Headers) UnmarshalFrame(hdr *Header, b []byte) error {
+	// TODO(jc): implement security padding and stream prioritization from
+	// initial Headers frame.
+	if hdr.Flags.Has(FlagHeadersPadded) {
+		return fmt.Errorf("headers: padding not implemented")
+	} else if hdr.Flags.Has(FlagHeadersPriority) {
+		return fmt.Errorf("headers: priority not implemented")
+	}
+
+	if hdr.Flags.Has(FlagHeadersEndStream) {
+		h.EndStream = true
+	}
+	if hdr.Flags.Has(FlagHeadersEndHeaders) {
+		h.EndHeaders = true
+	}
+
+	h.Header = *hdr
+	h.Block = make([]byte, len(b))
+	copy(h.Block, b)
+
+	return nil
+}
+
+const (
+	// FlagDataEndStream indicates a Data frame also terminates its Stream.
+	// RFC 7540 Section 6.1
+	FlagDataEndStream = Flags(0x01)
+
+	// FlagDataPadded indicates a Data frame contains trailing padding.
+	// RFC 7540 Section 6.1
+	FlagDataPadded = Flags(0x08)
+)
+
+// Data is used to carry request or response data between peers.
+//
+// NOTE(jc): Padding is not currently implemented.
+//
+// RFC 7540 Section 6.1
+type Data struct {
+	Header
+
+	// EndStream indicates this Data frame terminates the Stream.
+	EndStream bool
+
+	// Application data from peer.
+	Data []byte
+}
+
+// MarshalFrame marshals Data into the wire format.
+func (d *Data) MarshalFrame(hdr *Header) ([]byte, error) {
+	// TODO(jc): implement security padding.
+	if d.Header.Flags.Has(FlagDataPadded) {
+		return nil, fmt.Errorf("data: padding not implemented")
+	}
+
+	if d.EndStream {
+		hdr.Flags.Set(FlagDataEndStream)
+	}
+
+	hdr.Type = TypeData
+	hdr.Length = uint32(len(d.Data))
+	hdr.StreamID = d.Header.StreamID
+
+	b := make([]byte, len(d.Data))
+	copy(b, d.Data)
+
+	return b, nil
+}
+
+// UnmarshalFrame unmarshals Data from the wire format.
+func (d *Data) UnmarshalFrame(hdr *Header, b []byte) error {
+	// TODO(jc): implement security padding.
+	if hdr.Flags.Has(FlagDataPadded) {
+		return fmt.Errorf("data: padding not implemented")
+	}
+
+	if hdr.Flags.Has(FlagDataEndStream) {
+		d.EndStream = true
+	}
+
+	d.Header = *hdr
+	d.Data = make([]byte, len(b))
+	copy(d.Data, b)
 
 	return nil
 }
